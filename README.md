@@ -74,6 +74,7 @@ Each method directory contains `records.jsonl` (actual outcomes and conditional 
 | Public-only cost-ordered finite CEGIS | `core.synthesize / actions` | denialsafe; max_depth; candidate_budget |
 | Independent action and robustness checker | `oracle.replay / decision / check` | before ACCESS_RECOURSE release |
 | Access/process/conflict/abstention output | `core.synthesize` | actions / process_actions |
+| Authenticated repair binding and current PDP gate | `execution.certify / authorize` | application-owned signing key; example below |
 | Conditional validity, cost and same-view channel tests | `core.run_case / score` | evaluate; exact_robust / true_policy controls |
 | Aggregation, paired intervals and visualization | `cli.summarize; statistics.analyze; cli.plot` | evaluate / statistics / plot |
 
@@ -84,5 +85,27 @@ Validated locally: editable installation, syntax/import and regression checks, s
 Regression checks cover hand-computable rates and eligible denominators, the algorithm's safety boundary, and applicable replay/serialization paths. The documented small-data preparation, execution, suite, evaluation, statistics and plotting commands are the validation entry points. No complete training or large experimental campaign is required for these checks.
 
 The grammar and policy family are explicit finite JSON structures; no symbolic SMT backend, Cedar/Balana parser or channel-padding service is supplied. `synthesis_ms` times the first search; whole-case `latency_ms` also includes the exhaustive confidentiality audit and must not be presented as online explanation latency. Timing budgets preserve honest abstention, not a strict wall-clock secrecy claim. Learned attack recovery, retained-scope/workflow studies and native policy corpora need actual labeled records and are not synthesized as results.
+
+The local executor API authenticates the public-view/epoch/grammar/request/action
+binding, independently rechecks legality and robustness, and consults the current
+actual PDP before returning `EXECUTE`. Keep its HMAC key in the application;
+certificates are internal records, not rendered explanations. The application
+must perform its effect only for `EXECUTE` and keep its PDP check and effect within
+the authorization boundary appropriate to that application. It is not a remote
+transaction service or a one-time capability protocol.
+
+```python
+from denialsafe import core, execution
+
+# public, request, actual_policy and application_key come from the application.
+repair = core.synthesize(public, request)
+certificate = execution.certify(public, request, repair, application_key)
+decision = execution.authorize(
+    certificate, public, request, actual_policy, application_key
+)
+```
+
+The regression suite verifies successful repair, changed current policy, epoch
+invalidation, tampered binding and rejection of process guidance as access.
 
 The source retains its existing MIT license. Data and external systems remain subject to their own licenses and access rules.
