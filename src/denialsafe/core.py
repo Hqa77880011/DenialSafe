@@ -15,51 +15,22 @@ METHODS = [
     "public_templates",
     "sampled_policies",
     "no_feasibility",
+    "redacted_repair",
+    "causal_adaptation",
+    "secret_tie_break",
 ]
 
 
 def evaluate(policy, request):
-    for key in (
-        set(policy.get("required", []))
-        | set(policy.get("equals", {}))
-        | set(policy.get("members", {}))
-        | set(policy.get("minimum", {}))
-    ):
-        if key not in request:
-            return "Indeterminate"
-    same = lambda a, b: type(a) is type(b) and a == b
-    if any(
-        not same(request[key], value) for key, value in policy.get("equals", {}).items()
-    ):
-        return "Deny"
-    if any(
-        not any(same(request[key], value) for value in values)
-        for key, values in policy.get("members", {}).items()
-    ):
-        return "Deny"
-    for key, value in policy.get("minimum", {}).items():
-        if type(request[key]) not in (int, float) or type(value) not in (int, float):
-            return "Indeterminate"
-        if request[key] < value:
-            return "Deny"
-    for clause in policy.get("denies", []):
-        if all(
-            key in request and same(request[key], value)
-            for key, value in clause.items()
-        ):
-            return "Deny"
-    return "Permit"
+    from .policy import decision
+
+    return decision(policy, request)
 
 
 def possibility_set(public):
-    return [
-        policy
-        for policy in public["policies"]
-        if all(
-            evaluate(policy, item["request"]) == item["decision"]
-            for item in public.get("history", [])
-        )
-    ]
+    from .policy import possible
+
+    return [policy for assignment, policy in possible(public)]
 
 
 def apply_action(request, action, registry, check=True):
@@ -74,8 +45,21 @@ def apply_action(request, action, registry, check=True):
             )
         ):
             return None
-        if set(primitive.get("set", {})) & {"principal", "tenant", "provenance"}:
+        if check and not set(primitive.get("required_rights", [])) <= set(
+            current.get("rights", [])
+        ):
             return None
+        if (set(primitive.get("set", {})) | set(primitive.get("remove", []))) & {
+            "principal",
+            "tenant",
+            "provenance",
+            "rights",
+        }:
+            return None
+        if check and primitive.get("kind") == "process":
+            return None
+        for name in primitive.get("remove", []):
+            current.pop(name, None)
         current.update(primitive.get("set", {}))
     return current
 
@@ -103,84 +87,55 @@ def actions(public):
                 )
 
 
-def synthesize(public, request, method="denialsafe", secret=None):
-    """Finite CEGIS. Only the explicitly secret-aware baseline receives a secret."""
-    possible = possibility_set(public)
-    if not possible:
-        return {"type": "PUBLIC_CONFLICT", "sequence": [], "checks": 0}
+def synthesize(
+    public, request, method="denialsafe", secret=None, secret_attributes=None
+):
+    """Public-only SMT synthesis; secret-dependent diagnostics are explicit."""
+    from . import symbolic, search
+
+    if method not in METHODS:
+        raise ValueError("Unknown method: " + method)
+    stamp = time.perf_counter()
     if method == "decision_only":
-        return {"type": "ABSTAIN", "sequence": [], "checks": 0}
-    checked = 0
-    active = possible[:1]
-    start = time.perf_counter()
-    for index, sequence in enumerate(actions(public)):
-        if index >= public.get("candidate_budget", 100000) or (
-            public.get("time_budget_seconds") is not None
-            and time.perf_counter() - start >= public["time_budget_seconds"]
-        ):
-            return {
-                "type": "ABSTAIN",
-                "sequence": [],
-                "checks": checked,
-                "reason": "budget_exhausted",
-            }
-        transformed = apply_action(
-            request, sequence, public["actions"], check=method != "no_feasibility"
-        )
-        if transformed is None:
-            continue
-        if method == "public_templates" and tuple(sequence) != tuple(
-            public.get("template", [])
-        ):
-            continue
-        selected = (
-            [secret]
-            if method == "true_policy"
-            else (
-                possible if method in ("exact_robust", "public_templates") else active
+        return dict(type="ABSTAIN", sequence=[], checks=0)
+    if method == "exact_robust":
+        result = search.exact(public, request)
+    elif method == "public_templates":
+        result = search.templates(public, request)
+    else:
+        result = symbolic.synthesize(public, request, method, secret, secret_attributes)
+    result.setdefault(
+        "stage_ms",
+        {
+            ("enumeration_ms" if method == "exact_robust" else "template_search_ms"): (
+                time.perf_counter() - stamp
             )
-        )
-        checked += len(selected)
-        if any(evaluate(policy, transformed) != "Permit" for policy in selected):
-            continue
-        if method == "sampled_policies":
-            robust = True
-        else:
-            counter = next(
-                (
-                    policy
-                    for policy in possible
-                    if evaluate(policy, transformed) != "Permit"
-                ),
-                None,
-            )
-            checked += len(possible)
-            robust = counter is None
-            if counter is not None and counter not in active:
-                active.append(counter)
-        if method == "true_policy":
-            robust = True
-        if robust:
-            if method not in (
-                "true_policy",
-                "sampled_policies",
-                "no_feasibility",
-            ) and not oracle.check(public, request, sequence):
-                return {
-                    "type": "ABSTAIN",
-                    "sequence": [],
-                    "checks": checked,
-                    "reason": "checker_disagreement",
-                }
-            return {
-                "type": "ACCESS_RECOURSE",
-                "sequence": list(sequence),
-                "checks": checked,
-            }
-    for name, primitive in sorted(public.get("process_actions", {}).items()):
-        if apply_action(request, [name], {name: primitive}) is not None:
-            return {"type": "PROCESS_RECOURSE", "sequence": [name], "checks": checked}
-    return {"type": "ABSTAIN", "sequence": [], "checks": checked}
+            * 1000
+        },
+    )
+    if result["type"] == "ABSTAIN":
+        for name, primitive in sorted(public.get("process_actions", {}).items()):
+            if (
+                apply_action(
+                    request,
+                    [name],
+                    {
+                        name: {
+                            key: value
+                            for key, value in primitive.items()
+                            if key != "kind"
+                        }
+                    },
+                )
+                is not None
+            ):
+                return dict(
+                    type="PROCESS_RECOURSE",
+                    sequence=[name],
+                    checks=result["checks"],
+                    reason="public_process_instructions",
+                )
+    return result
 
 
 def generate(rng, count):
@@ -213,16 +168,31 @@ def generate(rng, count):
             },
             "set_level": {"set": {"level": 10}, "cost": 0.1, "user_executable": False},
         }
+        group = ("robust_solvable", "process_only", "no_robust")[index % 3]
+        request["level"] = max(thresholds) if group == "robust_solvable" else 0
         public = {
             "policies": policies,
             "actions": registry,
             "max_depth": 2,
             "history": [{"request": request, "decision": "Deny"}],
             "template": ["complete_mfa", "narrow_public"],
+            "templates": [
+                {"id": "public-subset-mfa", "goals": {"mfa": True, "scope": "public"}}
+            ],
         }
+        if group == "process_only":
+            public["process_actions"] = {
+                "submit_approval": dict(
+                    kind="process",
+                    user_executable=True,
+                    set={"workflow": "pending"},
+                    public_instruction="Submit a public approval request; access is not guaranteed",
+                )
+            }
         yield {
+            "group": group,
             "id": str(index),
-            "family": f"level-{request['level']}",
+            "family": "thresholds-" + "-".join(map(str, thresholds)) + ":" + group,
             "public": public,
             "request": request,
             "secret_index": rng.randrange(3),
@@ -230,31 +200,62 @@ def generate(rng, count):
 
 
 def run_case(case, method):
-    secret = case["public"]["policies"][case["secret_index"]]
+    if case.get("supported") is False:
+        return dict(
+            type="ABSTAIN",
+            sequence=[],
+            checks=0,
+            synthesis_ms=0,
+            unsupported=True,
+            reason=case.get("unsupported_reason", "unreviewed_or_unsupported_adapter"),
+        )
+    secret = actual_policy(case)
     start = time.perf_counter()
     result = synthesize(
         case["public"],
         case["request"],
         method,
-        secret if method == "true_policy" else None,
+        secret
+        if method
+        in ("true_policy", "redacted_repair", "causal_adaptation", "secret_tie_break")
+        else None,
+        secret_attributes=case.get("actual_request_attributes", {})
+        if method
+        in ("true_policy", "redacted_repair", "causal_adaptation", "secret_tie_break")
+        else None,
     )
     result["synthesis_ms"] = (time.perf_counter() - start) * 1000
-    result["public_output"] = json.dumps(
-        {k: result[k] for k in ["type", "sequence"]}, sort_keys=True
-    )
+    from .channel import render
+
+    result["public_output"] = render(case["public"], result).decode()
     outputs = []
-    for possible in possibility_set(case["public"]):
+    from .policy import possible as family_members, hidden_request
+
+    for assignment, possible in family_members(case["public"]):
         alternative = synthesize(
             case["public"],
             case["request"],
             method,
-            possible if method == "true_policy" else None,
-        )
-        outputs.append(
-            json.dumps(
-                {k: alternative[k] for k in ["type", "sequence"]}, sort_keys=True
+            possible
+            if method
+            in (
+                "true_policy",
+                "redacted_repair",
+                "causal_adaptation",
+                "secret_tie_break",
             )
+            else None,
+            secret_attributes=hidden_request(case["public"], assignment)
+            if method
+            in (
+                "true_policy",
+                "redacted_repair",
+                "causal_adaptation",
+                "secret_tie_break",
+            )
+            else None,
         )
+        outputs.append(render(case["public"], alternative).decode())
     result["matched_view_secret_gain"] = (
         (len(set(outputs)) - 1) / len(outputs) if outputs else 0.0
     )
@@ -267,20 +268,36 @@ def run_case(case, method):
 
 
 def score(case, result):
+    if result.get("unsupported"):
+        return dict(
+            coverage=0,
+            robust_coverage=0,
+            actual_policy_validity=None,
+            robust_validity=None,
+            unsupported=1,
+            abstention=1,
+            legal_effects=0,
+        )
     emitted = result["type"] == "ACCESS_RECOURSE"
     changed = (
-        oracle.replay(case["request"], result["sequence"], case["public"]["actions"])
+        oracle.projected_replay(case["public"], case["request"], result["sequence"])
         if emitted
         else None
     )
-    actual = case["public"]["policies"][case["secret_index"]]
+    actual = actual_policy(case)
     valid = (
-        emitted and changed is not None and oracle.decision(actual, changed) == "Permit"
+        emitted
+        and changed is not None
+        and oracle.decision(
+            actual, {**changed, **case.get("actual_request_attributes", {})}
+        )
+        == "Permit"
     )
-    robust = changed is not None and all(
-        oracle.decision(p, changed) == "Permit" for p in possibility_set(case["public"])
+    robust = changed is not None and oracle.check(
+        case["public"], case["request"], result["sequence"]
     )
     return {
+        **result.get("stage_ms", {}),
         "coverage": int(valid),
         "robust_coverage": int(emitted and robust),
         "actual_policy_validity": int(valid) if emitted else None,
@@ -304,4 +321,37 @@ def score(case, result):
         if valid
         else None,
         "legal_effects": int(valid),
+    }
+
+
+def actual_policy(case):
+    from .policy import instantiate
+
+    if "actual_policy" in case:
+        return case["actual_policy"]
+    public = case["public"]
+    if "skeleton" in public:
+        return instantiate(public["skeleton"], case["secret_assignment"])
+    return public["policies"][case["secret_index"]]
+
+
+def metric_counts(case, result):
+    names = {
+        "coverage",
+        "robust_coverage",
+        "actual_policy_validity",
+        "robust_validity",
+        "process_guidance",
+        "public_conflict",
+        "same_view_content_mismatch",
+        "failed_repair",
+        "illegal_repair",
+        "nonrobust_repair",
+        "abstention",
+        "unsupported",
+    }
+    return {
+        key: [value, 1] if value is not None else [0, 0]
+        for key, value in score(case, result).items()
+        if key in names
     }

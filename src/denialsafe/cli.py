@@ -259,6 +259,55 @@ def main():
         help="Render selected metric PNGs; CSV retains all metrics",
     )
     item.add_argument("--output", required=True)
+    for name in ("attack", "benchmark", "cache", "native-check", "execute", "scale"):
+        item = sub.add_parser(name)
+        item.add_argument("--case", required=True)
+        item.add_argument("--output", required=True)
+        if name in ("attack", "benchmark"):
+            item.add_argument(
+                "--methods", nargs="+", choices=core.METHODS, default=["denialsafe"]
+            )
+        if name == "attack":
+            item.add_argument(
+                "--visibility", choices=["black", "gray", "white"], default="black"
+            )
+            item.add_argument("--budget", type=int, default=100)
+            item.add_argument("--seed", type=int, default=17)
+            item.add_argument("--trajectory", action="store_true")
+        elif name == "benchmark":
+            item.add_argument("--calls", type=int, default=100)
+            item.add_argument("--restarts", type=int, default=5)
+            item.add_argument("--warmup", type=float, default=30)
+            item.add_argument("--seconds", type=float, default=120)
+            item.add_argument("--cache", choices=["cold", "warm"], default="cold")
+            item.add_argument("--controlled-channel", action="store_true")
+        elif name == "cache":
+            item.add_argument("--repeats", type=int, default=5)
+            item.add_argument("--controlled-channel", action="store_true")
+        elif name == "native-check":
+            item.add_argument("--backend", choices=["cedar", "balana"], required=True)
+            item.add_argument("--executable", required=True)
+            item.add_argument("--classpath")
+        elif name == "execute":
+            item.add_argument(
+                "--config",
+                required=True,
+                help="Trusted root/database/key_file/objects and optional native_pdp configuration",
+            )
+            item.add_argument(
+                "--operation",
+                required=True,
+                help="Trusted install/grant_mfa or client execute/process JSON request",
+            )
+        elif name == "scale":
+            item.add_argument("--dimensions", nargs="+", type=int, default=[2, 4, 8])
+            item.add_argument("--values", nargs="+", type=int, default=[2, 4, 8])
+            item.add_argument(
+                "--actions", nargs="+", type=int, default=[10, 30, 100, 300]
+            )
+            item.add_argument("--rules", nargs="+", type=int, default=[10, 100, 1000])
+            item.add_argument("--budgets", nargs="+", type=float, default=[0.1, 1, 10])
+            item.add_argument("--depths", nargs="+", type=int, default=[1, 2, 3])
     args = parser.parse_args()
     if args.command == "prepare":
         if args.count < 1:
@@ -275,8 +324,128 @@ def main():
             execute(cases, method, Path(args.output) / method)
     elif args.command == "evaluate":
         evaluate(args.records, args.output)
-    else:
+    elif args.command == "plot":
         plot(args.inputs, args.output, args.metrics)
+    else:
+        from . import evaluation
+
+        output = Path(args.output)
+        if output.exists():
+            raise FileExistsError(str(output))
+        case = json.loads(Path(args.case).read_text(encoding="utf-8"))
+        if args.command == "attack":
+            operation = (
+                evaluation.adaptive_trajectories
+                if args.trajectory
+                else evaluation.matched_attack
+            )
+            value = operation(
+                case["public"],
+                core.actual_policy(case),
+                case["probe_domains"],
+                args.methods,
+                args.budget,
+                args.visibility,
+                args.seed,
+                actual_request_attributes=case.get("actual_request_attributes", {}),
+            )
+        elif args.command == "benchmark":
+            if min(args.calls, args.restarts) < 1 or min(args.warmup, args.seconds) < 0:
+                raise ValueError("Invalid timing budget")
+            value = [
+                row
+                for method in args.methods
+                for row in evaluation.benchmark(
+                    case,
+                    method,
+                    args.calls,
+                    args.restarts,
+                    args.warmup,
+                    args.seconds,
+                    args.cache,
+                    args.controlled_channel,
+                )
+            ]
+        elif args.command == "cache":
+            value = evaluation.cache_campaign(
+                case["public"], case["request"], args.repeats, args.controlled_channel
+            )
+        elif args.command == "scale":
+            write_jsonl(
+                output,
+                evaluation.scale_cases(
+                    case,
+                    args.dimensions,
+                    args.values,
+                    args.actions,
+                    args.rules,
+                    args.budgets,
+                    args.depths,
+                ),
+            )
+            return
+        elif args.command == "native-check":
+            from . import native
+
+            if args.backend == "cedar":
+                value = native.cedar(
+                    core.actual_policy(case),
+                    {**case["request"], **case.get("actual_request_attributes", {})},
+                    args.executable,
+                    str(output) + ".artifacts",
+                )
+            else:
+                if not args.classpath:
+                    raise ValueError("Balana needs --classpath")
+                value = native.balana(
+                    core.actual_policy(case),
+                    {**case["request"], **case.get("actual_request_attributes", {})},
+                    args.executable,
+                    args.classpath,
+                    str(output) + ".artifacts",
+                )
+        else:
+            from .runtime import Executor
+            from . import native
+
+            config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+            key = Path(config.pop("key_file")).read_bytes()
+            backend = config.pop("native_pdp", None)
+            callback = None
+            if backend:
+                callback = (
+                    (
+                        lambda policy, request: native.cedar(
+                            policy, request, backend["executable"], backend["output"]
+                        )["decision"]
+                    )
+                    if backend["backend"] == "cedar"
+                    else (
+                        lambda policy, request: native.balana(
+                            policy,
+                            request,
+                            backend["executable"],
+                            backend["classpath"],
+                            backend["output"],
+                        )["decision"]
+                    )
+                )
+            executor = Executor(key=key, pdp=callback, **config)
+            request = json.loads(Path(args.operation).read_text(encoding="utf-8"))
+            operation = request.pop("operation")
+            if operation not in (
+                "install",
+                "set_identity",
+                "grant_mfa",
+                "execute",
+                "process",
+            ):
+                raise ValueError("Unknown operation")
+            value = getattr(executor, operation)(**request)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps(value, indent=2, allow_nan=False), encoding="utf-8"
+        )
 
 
 if __name__ == "__main__":

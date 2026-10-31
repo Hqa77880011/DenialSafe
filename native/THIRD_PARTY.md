@@ -1,0 +1,5 @@
+The Java source here is an original thin application adapter. It calls the real [WSO2 Balana](https://github.com/wso2/balana) 1.2.24 PDP through its documented Balana/PDP APIs. Maven resolves Balana and its utilities, Commons Logging and Pax Logging; their artifacts retain their own license and notice metadata. Balana is released under Apache-2.0 and retains applicable Sun XACML notices. No upstream evaluator is copied or renamed.
+
+The optional [Cedar CLI](https://github.com/cedar-policy/cedar) is a separately installed executable (locally validated 4.14.0). Its source and license remain upstream. The adapter implements a declared common translation fragment and retains raw native categories alongside its explicitly declared published projection. It does not claim complete Cedar/XACML language equivalence.
+
+Portable JDK/Maven and dependency jars are kept in ignored application-local directories. No runtime binary, benchmark corpus or original result table is included in the source distribution.

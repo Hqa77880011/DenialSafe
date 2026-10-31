@@ -29,18 +29,22 @@ def certify(public, request, result, key):
     """Issue an authenticated record only for independently valid access recourse."""
     if not isinstance(key, bytes) or not key:
         raise ValueError("A nonempty application-owned signing key is required")
-    if result["type"] != "ACCESS_RECOURSE" or not oracle.check(
+    if result["type"] != "ACCESS_RECOURSE" or not independent_check(
         public, request, result["sequence"]
     ):
         raise ValueError("Only independently certified access recourse can execute")
     payload = _binding(public, request, result["sequence"])
     return {
         "payload": payload,
-        "signature": hmac.new(key, _encode(payload).encode(), hashlib.sha256).hexdigest(),
+        "signature": hmac.new(
+            key, _encode(payload).encode(), hashlib.sha256
+        ).hexdigest(),
     }
 
 
-def authorize(certificate, public, request, actual_policy, key):
+def authorize(
+    certificate, public, request, actual_policy, key, private_attributes=None
+):
     """Recheck binding, primitive legality, robustness and the current actual PDP."""
     payload = certificate["payload"]
     signature = hmac.new(key, _encode(payload).encode(), hashlib.sha256).hexdigest()
@@ -48,9 +52,33 @@ def authorize(certificate, public, request, actual_policy, key):
         return {"type": "INVALID_CERTIFICATE"}
     if _encode(payload) != _encode(_binding(public, request, payload["sequence"])):
         return {"type": "STALE_BINDING"}
-    transformed = oracle.replay(request, payload["sequence"], public["actions"])
-    if transformed is None or not oracle.check(public, request, payload["sequence"]):
+    transformed = oracle.projected_replay(public, request, payload["sequence"])
+    if transformed is None or not independent_check(
+        public, request, payload["sequence"]
+    ):
         return {"type": "REPAIR_REJECTED"}
-    if oracle.decision(actual_policy, transformed) != "Permit":
+    if (
+        oracle.decision(actual_policy, {**transformed, **(private_attributes or {})})
+        != "Permit"
+    ):
         return {"type": "ACCESS_DENIED"}
     return {"type": "EXECUTE", "request": transformed}
+
+
+def independent_check(public, request, sequence):
+    import math
+
+    size = (
+        math.prod(
+            len(values) for values in public.get("hidden_request_fields", {}).values()
+        )
+        * math.prod(len(values) for values in public.get("holes", {}).values())
+        * max(1, len(public.get("policies", [])))
+    )
+    if size <= public.get("enumerative_check_limit", 128):
+        return oracle.check(public, request, sequence)
+    from .symbolic import certified
+
+    return certified(public, request, sequence, public.get("solver_timeout_ms", 1000))[
+        0
+    ]
